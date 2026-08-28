@@ -127,9 +127,10 @@ def find_all_patterns(docx_path, style="auto"):
                 patterns.add(m.group(0))
 
     else:  # superscript
-        # Read directly from superscript XML runs in the body (before References)
-        ref_start = xml.find(">References<")
-        body_xml = xml[:ref_start] if ref_start > 0 else xml
+        # Read directly from superscript XML runs — body only (skip title page)
+        body_start = _find_body_start(xml)
+        ref_start  = xml.find(">References<")
+        body_xml   = xml[body_start:ref_start] if ref_start > 0 else xml[body_start:]
 
         # Each superscript run may contain "1" or "1,2" or "10,11" etc.
         sup_contents = re.findall(
@@ -340,18 +341,43 @@ def build_replacements(patterns, cmap, style="bracket"):
     return repls
 
 
+def _find_body_start(xml):
+    """
+    Return the position where actual body text begins — after the title/author
+    block. Affiliation superscripts (1, 2, 3) live in the title block and must
+    NOT be converted. Citations start at Abstract or Introduction.
+    """
+    for marker in (
+        ">Abstract<", ">ABSTRACT<",
+        ">Introduction<", ">INTRODUCTION<",
+        ">Background<", ">BACKGROUND<",
+        ">Summary<",
+    ):
+        pos = xml.find(marker)
+        if pos > 0:
+            # Step back to the start of the paragraph containing this heading
+            para_start = xml.rfind("<w:p ", 0, pos)
+            return para_start if para_start > 0 else pos
+    return 0  # fallback: process whole document (bracket style is safe anyway)
+
+
 def convert_superscript_xml(xml, cmap):
     """
     Replace superscript citation runs in body XML with plain temp-citation runs.
 
+    Skips everything before Abstract/Introduction (affiliation numbers on the
+    title page look identical to citations — must not touch them).
     Iterates run-by-run using indexOf (NOT regex DOTALL) to avoid the greedy
     match problem where .*? crosses paragraph boundaries and eats body text.
     """
-    ref_start = xml.find(">References<")
+    body_start = _find_body_start(xml)
+    ref_start  = xml.find(">References<")
     if ref_start < 0:
         ref_start = len(xml)
-    body = xml[:ref_start]
-    tail = xml[ref_start:]
+
+    prefix = xml[:body_start]          # title page — leave completely alone
+    body   = xml[body_start:ref_start] # body text — convert citations here
+    tail   = xml[ref_start:]           # reference list — leave alone
 
     result = []
     pos = 0
@@ -398,7 +424,7 @@ def convert_superscript_xml(xml, cmap):
 
         result.append(run_xml)
 
-    return "".join(result) + tail
+    return prefix + "".join(result) + tail
 
 
 # ── 9. Convert citations in XML (handles all split patterns) ─────────────────
