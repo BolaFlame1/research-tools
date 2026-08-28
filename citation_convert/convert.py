@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """
-citation_convert — Convert numbered citations in a Word .docx to EndNote temp citations.
+citation_convert v3 — Convert numbered citations to EndNote temp citations.
 
-Generates an EndNote XML file that:
-  1. Can be imported into a fresh EndNote library (File → Import → XML)
-  2. Can be indexed by endnote-mcp so Claude can verify record numbers
+Uses authoritative RIS downloaded directly from CrossRef (not self-constructed
+XML), eliminating hallucination risk for author names, years, and journal data.
+
+Outputs:
+  <stem>_converted.docx  — citations replaced with {Author, Year #N}
+  <stem>.ris             — combined RIS file for EndNote import
+
+doi_overrides.json (optional, place next to the docx):
+  Provides DOIs for references that lack them in the reference list, and
+  manual RIS entries for items without DOIs (WHO books, reports, etc.).
+  See template at ~/research/tools/citation_convert/doi_overrides_template.json
 
 Usage:
-    python convert.py <input.docx> [options]
-
-Options:
-    --output PATH    Output .docx path (default: <stem>_converted.docx)
-    --xml PATH       EndNote XML path (default: <stem>_endnote.xml)
-    --email EMAIL    Email for CrossRef polite pool
-    --dry-run        Show detected refs and citations without converting
+    python3 convert.py <input.docx> [--email EMAIL] [--dry-run]
 """
 
 import argparse
+import json
 import re
 import shutil
 import sys
@@ -31,7 +34,7 @@ except ImportError:
     sys.exit("pip install requests")
 
 
-# ── 1. Extract plain text ────────────────────────────────────────────────────
+# ── 1. Extract plain text from docx ─────────────────────────────────────────
 
 def docx_plain(docx_path):
     with zipfile.ZipFile(docx_path) as z:
@@ -42,7 +45,7 @@ def docx_plain(docx_path):
 
 # ── 2. Extract reference list ────────────────────────────────────────────────
 
-def _extract_doi(text):
+def _extract_doi_from_text(text):
     for pat in (r"https?://doi\.org/(\S+)", r"\bdoi:\s*(\S+)"):
         m = re.search(pat, text, re.IGNORECASE)
         if m:
@@ -51,13 +54,6 @@ def _extract_doi(text):
 
 
 def extract_references(docx_path):
-    """
-    Find numbered references in the References section.
-    Handles two formats automatically:
-      - Lancet/Vancouver: [1] Author ... DOI
-      - PLoS/APA:         1. Author ... doi:...
-    Returns list of dicts: {num, text, doi}
-    """
     text = docx_plain(docx_path)
     m = re.search(r"\n(?:References|REFERENCES|Bibliography)\n(.+)", text, re.DOTALL)
     if not m:
@@ -65,349 +61,266 @@ def extract_references(docx_path):
     ref_text = m.group(1)
 
     refs = []
-
-    # Try Lancet format: [N] text
-    bracket_matches = list(re.finditer(r"\[(\d+)\]\s*(.+?)(?=\n\[|\Z)", ref_text, re.DOTALL))
-    if bracket_matches:
-        for bm in bracket_matches:
+    # Lancet/Vancouver: [N] text
+    bracket = list(re.finditer(r"\[(\d+)\]\s*(.+?)(?=\n\[|\Z)", ref_text, re.DOTALL))
+    if bracket:
+        for bm in bracket:
             body = " ".join(bm.group(2).split())
-            refs.append({"num": int(bm.group(1)), "text": body, "doi": _extract_doi(body)})
+            refs.append({"num": int(bm.group(1)), "text": body,
+                         "doi": _extract_doi_from_text(body)})
     else:
-        # Try PLoS/numbered format: N. text (N followed by period+space at line start)
-        plos_matches = list(re.finditer(r"(?:^|\n)(\d+)\.\s+(.+?)(?=\n\d+\.|\Z)", ref_text, re.DOTALL))
-        for pm in plos_matches:
+        # PLoS / APA: N. text
+        for pm in re.finditer(r"(?:^|\n)(\d+)\.\s+(.+?)(?=\n\d+\.|\Z)", ref_text, re.DOTALL):
             body = " ".join(pm.group(2).split())
-            refs.append({"num": int(pm.group(1)), "text": body, "doi": _extract_doi(body)})
+            refs.append({"num": int(pm.group(1)), "text": body,
+                         "doi": _extract_doi_from_text(body)})
 
     if not refs:
-        raise ValueError(
-            "No numbered references found. Expected '[N] Author...' or 'N. Author...' format."
-        )
+        raise ValueError("No numbered references found. Expected '[N] ...' or 'N. ...' format.")
     return refs
 
 
-# ── 3. Auto-detect all citation patterns ────────────────────────────────────
+# ── 3. doi_overrides.json ────────────────────────────────────────────────────
 
-def detect_citation_style(docx_path):
+def load_overrides(docx_path):
     """
-    Returns 'bracket' ([N] format) or 'superscript' (PLoS/numbered superscript).
+    Load <stem>.doi_overrides.json if it exists next to the docx.
+    Returns dict keyed by str(ref_num).
     """
+    p = Path(docx_path)
+    override_path = p.parent / (p.stem + ".doi_overrides.json")
+    if override_path.exists():
+        with open(override_path) as f:
+            data = json.load(f)
+        # Remove comment key if present
+        data.pop("_note", None)
+        print(f"  Loaded overrides: {override_path.name} ({len(data)} entries)")
+        return data
+    return {}
+
+
+def get_doi(ref, overrides):
+    """Return DOI for a reference: text first, then overrides."""
+    if ref["doi"]:
+        return ref["doi"]
+    entry = overrides.get(str(ref["num"]), {})
+    return entry.get("doi")
+
+
+def get_manual_ris(ref, overrides):
+    """Return manual RIS string for a reference if provided in overrides."""
+    entry = overrides.get(str(ref["num"]), {})
+    return entry.get("ris")
+
+
+# ── 4. Fetch RIS from CrossRef ───────────────────────────────────────────────
+
+def fetch_ris(doi, email):
+    """
+    Fetch authoritative RIS from CrossRef transform endpoint.
+    Falls back to doi.org content negotiation if CrossRef transform fails.
+    Returns RIS text string or None.
+    """
+    headers = {"User-Agent": f"citation-convert/3.0 mailto:{email}"}
+
+    # Primary: CrossRef transform (most reliable, works for all CrossRef DOIs)
+    url = f"https://api.crossref.org/works/{doi}/transform/application/x-research-info-systems"
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code == 200 and "TY  -" in r.text:
+            return r.text.strip()
+    except Exception as e:
+        print(f"    CrossRef transform failed: {e}")
+
+    # Fallback: doi.org content negotiation
+    try:
+        r = requests.get(
+            f"https://doi.org/{doi}",
+            headers={**headers, "Accept": "application/x-research-info-systems"},
+            timeout=15, allow_redirects=True
+        )
+        if r.status_code == 200 and "TY  -" in r.text:
+            return r.text.strip()
+    except Exception as e:
+        print(f"    doi.org fallback failed: {e}")
+
+    return None
+
+
+# ── 5. Parse RIS entry ───────────────────────────────────────────────────────
+
+def parse_ris(ris_text):
+    """
+    Extract first author last name and publication year from a RIS entry.
+    Returns (author_last, year_int).
+    """
+    author, year = "Unknown", 0
+
+    for line in ris_text.splitlines():
+        line = line.strip()
+        tag = line[:2]
+        val = line[6:].strip() if len(line) > 6 else ""
+
+        if tag == "AU" and author == "Unknown" and val:
+            # RIS AU format: "Last, First" or "Last, F." or "Organization Name"
+            author = val.split(",")[0].strip()
+
+        elif tag in ("PY", "DA", "Y1") and not year and val:
+            # PY  - 2022  or  PY  - 2022/01/01
+            m = re.search(r"\b(19|20)\d{2}\b", val)
+            if m:
+                year = int(m.group(0))
+
+    return author, year
+
+
+# ── 6. Auto-detect citation style ────────────────────────────────────────────
+
+def detect_style(docx_path):
     with zipfile.ZipFile(docx_path) as z:
         xml = z.read("word/document.xml").decode("utf-8")
     plain = re.sub(r"<[^>]+>", "", xml)
-    bracket_count = len(re.findall(r"\[\d+\]", plain))
-    sup_count = len(re.findall(r'vertAlign w:val="superscript"', xml))
-    return "bracket" if bracket_count >= sup_count else "superscript"
+    brackets = len(re.findall(r"\[\d+\]", plain))
+    sups = len(re.findall(r'vertAlign w:val="superscript"', xml))
+    return "bracket" if brackets >= sups else "superscript"
 
 
-def find_all_patterns(docx_path, style="auto"):
-    """
-    Return every citation pattern found in the document body.
-    style: 'bracket' | 'superscript' | 'auto'
+# ── 7. Find citation patterns ─────────────────────────────────────────────────
 
-    For superscript style, reads directly from superscript XML runs
-    (content like "1" or "1,2" or "25,2,26") — no plain-text guessing.
-    """
-    if style == "auto":
-        style = detect_citation_style(docx_path)
+def _find_body_start(xml):
+    for marker in (">Abstract<", ">ABSTRACT<", ">Introduction<",
+                   ">INTRODUCTION<", ">Background<", ">Summary<"):
+        pos = xml.find(marker)
+        if pos > 0:
+            para = xml.rfind("<w:p ", 0, pos)
+            return para if para > 0 else pos
+    return 0
 
+
+def find_all_patterns(docx_path, style):
     with zipfile.ZipFile(docx_path) as z:
         xml = z.read("word/document.xml").decode("utf-8")
     plain = re.sub(r"<[^>]+>", "", xml)
 
     patterns = set()
-
     if style == "bracket":
-        # Combined: [5,6] [9,10] etc.
         patterns |= set(re.findall(r"\[\d+(?:,\s*\d+)+\]", plain))
-        # Single: [1] — exclude ref-list entries (followed by space + capital)
         for m in re.finditer(r"\[(\d+)\]", plain):
-            ctx = plain[m.end():m.end()+3]
+            ctx = plain[m.end():m.end() + 3]
             if not re.match(r"\s+[A-Z]", ctx):
                 patterns.add(m.group(0))
-
-    else:  # superscript
-        # Read directly from superscript XML runs — body only (skip title page)
+    else:
         body_start = _find_body_start(xml)
         ref_start  = xml.find(">References<")
         body_xml   = xml[body_start:ref_start] if ref_start > 0 else xml[body_start:]
-
-        # Each superscript run may contain "1" or "1,2" or "10,11" etc.
-        sup_contents = re.findall(
-            r'<w:vertAlign w:val="superscript"[^>]*/>'
-            r'(?:[^<]*</w:rPr>)?'           # close rPr
-            r'<w:t[^>]*>([\d,\s]+)</w:t>',  # capture the number(s)
+        for content in re.findall(
+            r'<w:vertAlign w:val="superscript"[^>]*/>(?:[^<]*</w:rPr>)?<w:t[^>]*>([\d,\s]+)</w:t>',
             body_xml
-        )
-        for content in sup_contents:
+        ):
             content = content.strip()
             nums = [int(n) for n in re.findall(r"\d+", content)]
-            # Filter: must be plausible citation numbers (1..200), not years/stats
             if nums and all(1 <= n <= 200 for n in nums):
                 patterns.add(content)
 
-    return patterns, style
+    return patterns
 
 
-# ── 4. CrossRef ─────────────────────────────────────────────────────────────
+# ── 8. Build citation map from RIS data ──────────────────────────────────────
 
-def crossref_fetch(doi, email):
-    url = f"https://api.crossref.org/works/{doi}"
-    hdrs = {"User-Agent": f"citation-convert/2.0 mailto:{email}"}
-    try:
-        r = requests.get(url, headers=hdrs, timeout=15)
-        if r.status_code == 200:
-            return r.json()["message"]
-    except Exception as e:
-        print(f"    CrossRef error for {doi}: {e}")
-    return None
-
-
-def crossref_year(msg):
-    for f in ("published", "published-print", "published-online", "issued"):
-        if f in msg and "date-parts" in msg[f]:
-            p = msg[f]["date-parts"]
-            if p and p[0]:
-                return int(p[0][0])
-    return None
-
-
-def crossref_first_author(msg):
-    authors = msg.get("author", [])
-    if not authors:
-        return msg.get("institution", [{}])[0].get("name", "Unknown").split()[0]
-    a = authors[0]
-    return a.get("family", a.get("name", "Unknown").split()[0])
-
-
-def fetch_all(refs, email):
-    meta = {}
-    for ref in refs:
-        num, doi = ref["num"], ref["doi"]
-        if not doi:
-            print(f"  [{num}] No DOI — will use fallback")
-            continue
-        print(f"  [{num}] {doi}")
-        msg = crossref_fetch(doi, email)
-        if msg:
-            meta[num] = {
-                "msg": msg,
-                "year": crossref_year(msg),
-                "author": crossref_first_author(msg),
-                "title": (msg.get("title", [""])[0] or ""),
-                "journal": (msg.get("container-title", [""])[0] or ""),
-                "doi": doi,
-                "type": msg.get("type", "journal-article"),
-            }
-        else:
-            print(f"    No CrossRef data for [{num}]")
-        time.sleep(0.25)
-    return meta
-
-
-# ── 5. Fallback author/year from reference text ──────────────────────────────
-
-def parse_fallback(text):
-    am = re.search(r"[A-Z][a-záéíóúñü\-]+", text)
-    author = am.group(0) if am else "Unknown"
-    ym = re.search(r"\b(19|20)\d{2}\b", text)
-    year = int(ym.group(0)) if ym else 2000
-    return author, year
-
-
-# ── 6. Build citation map ────────────────────────────────────────────────────
-
-def build_map(refs, meta):
+def build_citation_map(refs, ris_data):
     """
+    ris_data: {num: ris_text_string}
     Returns {num: {author, year, record_num, temp_cite}}
-    record_num = 1-indexed import order (predictable in a fresh library)
+    record_num = 1..N in reference list order (fresh library → guaranteed match)
     """
     cmap = {}
     for i, ref in enumerate(sorted(refs, key=lambda r: r["num"])):
         num = ref["num"]
         rec = i + 1
-        if num in meta:
-            author = meta[num]["author"]
-            year = meta[num]["year"] or 0
-        else:
-            author, year = parse_fallback(ref["text"])
+        ris = ris_data.get(num, "")
+        author, year = parse_ris(ris) if ris else ("Unknown", 0)
+        if author == "Unknown":
+            # Last fallback: first capitalised word from reference text
+            m = re.search(r"[A-Z][a-záéíóúñü\-]+", ref["text"])
+            author = m.group(0) if m else "Unknown"
+        if not year:
+            m = re.search(r"\b(19|20)\d{2}\b", ref["text"])
+            year = int(m.group(0)) if m else 0
+
         cmap[num] = {
-            "author": author,
-            "year": year,
+            "author":     author,
+            "year":       year,
             "record_num": rec,
-            "temp_cite": f"{{{author}, {year} #{rec}}}",
+            "temp_cite":  f"{{{author}, {year} #{rec}}}",
         }
     return cmap
 
 
-# ── 7. Generate EndNote XML ──────────────────────────────────────────────────
+# ── 9. Build replacement table ───────────────────────────────────────────────
 
-_TYPES = {
-    "journal-article":    ("Journal Article", 17),
-    "book":               ("Book", 6),
-    "book-chapter":       ("Book Section", 5),
-    "posted-content":     ("Electronic Article", 43),
-    "report":             ("Report", 27),
-    "proceedings-article":("Conference Paper", 47),
-    "dataset":            ("Dataset", 59),
-}
-
-def _esc(s):
-    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def generate_endnote_xml(refs, meta, cmap):
-    lines = ['<?xml version="1.0" encoding="UTF-8"?>', "<xml>", "<records>"]
-
-    for ref in sorted(refs, key=lambda r: r["num"]):
-        num = ref["num"]
-        rec = cmap[num]["record_num"]
-        m = meta.get(num)
-
-        if m:
-            msg = m["msg"]
-            tname, tnum = _TYPES.get(m["type"], ("Journal Article", 17))
-            authors = msg.get("author", [])
-            title   = _esc(m["title"])
-            journal = _esc(m["journal"])
-            year    = cmap[num]["year"]
-            vol     = msg.get("volume", "")
-            iss     = msg.get("issue", "")
-            pages   = msg.get("page", "").replace("-", "–")
-            doi     = m["doi"]
-            abstract = _esc(re.sub(r"<[^>]+>", "", msg.get("abstract", ""))[:2000])
-        else:
-            tname, tnum = "Journal Article", 17
-            authors, title, journal = [], _esc(ref["text"][:120]), ""
-            year    = cmap[num]["year"]
-            vol = iss = pages = doi = abstract = ""
-
-        lines += [
-            "<record>",
-            f"  <rec-number>{rec}</rec-number>",
-            f'  <ref-type name="{tname}">{tnum}</ref-type>',
-        ]
-        if authors:
-            lines.append("  <contributors><authors>")
-            for a in authors[:20]:
-                last  = a.get("family", a.get("name", ""))
-                first = a.get("given", "")
-                lines.append(f"    <author>{_esc(last + (', ' + first if first else ''))}</author>")
-            lines.append("  </authors></contributors>")
-
-        lines += [
-            "  <titles>",
-            f"    <title>{title}</title>",
-            *([ f"    <secondary-title>{journal}</secondary-title>"] if journal else []),
-            "  </titles>",
-        ]
-        if year:
-            lines.append(f"  <dates><year>{year}</year></dates>")
-        if vol:
-            lines.append(f"  <volume>{vol}</volume>")
-        if iss:
-            lines.append(f"  <number>{iss}</number>")
-        if pages:
-            lines.append(f"  <pages>{pages}</pages>")
-        if doi:
-            lines += [
-                f"  <electronic-resource-num>{doi}</electronic-resource-num>",
-                f"  <urls><related-urls><url>https://doi.org/{doi}</url></related-urls></urls>",
-            ]
-        if abstract:
-            lines.append(f"  <abstract>{abstract}</abstract>")
-        lines.append("</record>")
-
-    lines += ["</records>", "</xml>"]
-    return "\n".join(lines)
-
-
-# ── 8. Build replacement table ───────────────────────────────────────────────
-
-def build_replacements(patterns, cmap, style="bracket"):
+def build_replacements(patterns, cmap, style):
     repls = {}
     for pat in patterns:
         nums = [int(n) for n in re.findall(r"\d+", pat)]
         missing = [n for n in nums if n not in cmap]
         if missing:
-            print(f"  WARNING: ref(s) {missing} in pattern {pat} not in reference list")
+            print(f"  WARNING: ref(s) {missing} in pattern '{pat}' not in reference list")
             continue
         if len(nums) == 1:
             repls[pat] = cmap[nums[0]]["temp_cite"]
         else:
-            parts = [f"{cmap[n]['author']}, {cmap[n]['year']} #{cmap[n]['record_num']}"
-                     for n in nums]
+            parts = [
+                f"{cmap[n]['author']}, {cmap[n]['year']} #{cmap[n]['record_num']}"
+                for n in nums
+            ]
             repls[pat] = "{" + "; ".join(parts) + "}"
     return repls
 
 
-def _find_body_start(xml):
-    """
-    Return the position where actual body text begins — after the title/author
-    block. Affiliation superscripts (1, 2, 3) live in the title block and must
-    NOT be converted. Citations start at Abstract or Introduction.
-    """
-    for marker in (
-        ">Abstract<", ">ABSTRACT<",
-        ">Introduction<", ">INTRODUCTION<",
-        ">Background<", ">BACKGROUND<",
-        ">Summary<",
-    ):
-        pos = xml.find(marker)
-        if pos > 0:
-            # Step back to the start of the paragraph containing this heading
-            para_start = xml.rfind("<w:p ", 0, pos)
-            return para_start if para_start > 0 else pos
-    return 0  # fallback: process whole document (bracket style is safe anyway)
+# ── 10. Convert citations in docx XML ────────────────────────────────────────
+
+PROOF = r"(?:<w:proofErr[^/]*/>\s*)*"
+
+
+def _resolve_author(author_str, cmap):
+    al = author_str.strip().lower()
+    for num, info in cmap.items():
+        if info["author"].lower() == al:
+            return info
+    return None
 
 
 def convert_superscript_xml(xml, cmap):
-    """
-    Replace superscript citation runs in body XML with plain temp-citation runs.
-
-    Skips everything before Abstract/Introduction (affiliation numbers on the
-    title page look identical to citations — must not touch them).
-    Iterates run-by-run using indexOf (NOT regex DOTALL) to avoid the greedy
-    match problem where .*? crosses paragraph boundaries and eats body text.
-    """
     body_start = _find_body_start(xml)
     ref_start  = xml.find(">References<")
     if ref_start < 0:
         ref_start = len(xml)
 
-    prefix = xml[:body_start]          # title page — leave completely alone
-    body   = xml[body_start:ref_start] # body text — convert citations here
-    tail   = xml[ref_start:]           # reference list — leave alone
+    prefix = xml[:body_start]
+    body   = xml[body_start:ref_start]
+    tail   = xml[ref_start:]
 
     result = []
     pos = 0
-
     while pos < len(body):
-        # Find the next opening run tag
         run_open = body.find("<w:r", pos)
         if run_open < 0:
             result.append(body[pos:])
             break
-
-        # Append everything up to this run
         result.append(body[pos:run_open])
-
-        # Find the matching closing tag (w:r elements are never nested)
         run_close = body.find("</w:r>", run_open)
         if run_close < 0:
             result.append(body[run_open:])
             break
         run_close += len("</w:r>")
-
         run_xml = body[run_open:run_close]
         pos = run_close
 
-        # Only process runs that are superscript AND contain only digits/commas
-        if ('vertAlign w:val="superscript"' in run_xml):
+        if 'vertAlign w:val="superscript"' in run_xml:
             tm = re.search(r"<w:t[^>]*>([\d,\s]+)</w:t>", run_xml)
             if tm:
                 content = tm.group(1).strip()
-                nums = [int(n) for n in re.findall(r"\d+", content)]
+                nums  = [int(n) for n in re.findall(r"\d+", content)]
                 valid = [n for n in nums if n in cmap]
                 if valid:
                     if len(valid) == 1:
@@ -421,91 +334,54 @@ def convert_superscript_xml(xml, cmap):
                         cite = "{" + "; ".join(parts) + "}"
                     result.append(f'<w:r><w:t xml:space="preserve"> {cite}</w:t></w:r>')
                     continue
-
         result.append(run_xml)
 
     return prefix + "".join(result) + tail
 
 
-# ── 9. Convert citations in XML (handles all split patterns) ─────────────────
-
-PROOF = r"(?:<w:proofErr[^/]*/>\s*)*"
-
-
-def _resolve_author(author, cmap):
-    """Find record by author last name match (case-insensitive)."""
-    al = author.strip().lower()
-    for num, info in cmap.items():
-        if info["author"].lower() == al:
-            return info
-    return None
-
-
-def convert_xml(xml, repls, cmap):
-    # Pass 1 — simple complete string replacements (longest first)
+def convert_bracket_xml(xml, repls, cmap):
+    # Pass 1: simple string replacements (longest first, bracket-safe)
     for old, new in sorted(repls.items(), key=lambda x: -len(x[0])):
         xml = xml.replace(old, new)
 
-    # Pass 2 — two-way split across run boundary
-    def fix2(m):
-        pre, nums_str = m.group(1), m.group(2)
-        nums = [int(n) for n in re.findall(r"\d+", nums_str)]
-        key = "[" + ",".join(str(n) for n in nums) + "]"
-        if key in repls:
-            return pre + repls[key]
-        return m.group(0)
-
-    xml = re.sub(
-        r"(\{[A-Za-zÀ-ž\-]+, )\[(\d+(?:,\d+)*)\]",
-        fix2, xml
-    )
-
-    # Pass 3 — three-way spell-check split: {  | Author | , year}
+    # Pass 2: three-way split {  | Author | , year}
     def fix3(m):
         tag, pre, author, tail = m.group(1), m.group(2), m.group(3), m.group(4)
         info = _resolve_author(author, cmap)
         if not info:
             return m.group(0)
-        before = pre[:-1]
         cite = f"{{{author}, {info['year']} #{info['record_num']}}}"
-        return f"{tag}{before}{cite}</w:t></w:r>"
+        return f"{tag}{pre[:-1]}{cite}</w:t></w:r>"
 
     xml = re.sub(
-        r"(<w:t[^>]*>)([^<]*\{)</w:t></w:r>"
-        + PROOF
-        + r"<w:r[^>]*><w:t[^>]*>([^<]+)</w:t></w:r>"
-        + PROOF
-        + r"<w:r[^>]*><w:t[^>]*>(, \d{4}[^<]*)\}</w:t></w:r>",
+        r"(<w:t[^>]*>)([^<]*\{)</w:t></w:r>" + PROOF +
+        r"<w:r[^>]*><w:t[^>]*>([^<]+)</w:t></w:r>" + PROOF +
+        r"<w:r[^>]*><w:t[^>]*>(, \d{4}[^<]*)\}</w:t></w:r>",
         fix3, xml, flags=re.DOTALL,
     )
 
-    # Pass 4 — four-way split: { | Author | ,<space> | year}
+    # Pass 3: four-way split { | Author | , <space> | year}
     def fix4(m):
         run_open, pre, author, year_str = m.group(1), m.group(2), m.group(3), m.group(5)
         info = _resolve_author(author, cmap)
         if not info:
             return m.group(0)
-        before = pre[:-1]
         cite = f"{{{author}, {info['year']} #{info['record_num']}}}"
-        return f'{run_open}<w:t xml:space="preserve">{before}{cite}</w:t></w:r>'
+        return f'{run_open}<w:t xml:space="preserve">{pre[:-1]}{cite}</w:t></w:r>'
 
     xml = re.sub(
-        r"(<w:r[^>]*><w:t[^>]*>)([^<]*\{)</w:t></w:r>"
-        + PROOF
-        + r"<w:r[^>]*><w:t[^>]*>([^<]+)</w:t></w:r>"
-        + PROOF
-        + r"<w:r[^>]*><w:t[^>]*>(, )</w:t></w:r>"
-        + PROOF
-        + r"<w:r[^>]*><w:t[^>]*>(\d{4}[^<]*)\}</w:t></w:r>",
+        r"(<w:r[^>]*><w:t[^>]*>)([^<]*\{)</w:t></w:r>" + PROOF +
+        r"<w:r[^>]*><w:t[^>]*>([^<]+)</w:t></w:r>" + PROOF +
+        r"<w:r[^>]*><w:t[^>]*>(, )</w:t></w:r>" + PROOF +
+        r"<w:r[^>]*><w:t[^>]*>(\d{4}[^<]*)\}</w:t></w:r>",
         fix4, xml, flags=re.DOTALL,
     )
-
     return xml
 
 
-# ── 10. Apply to docx ────────────────────────────────────────────────────────
+# ── 11. Apply to docx ────────────────────────────────────────────────────────
 
-def apply_to_docx(src, dst, repls, cmap, style="bracket"):
+def apply_to_docx(src, dst, repls, cmap, style):
     import os
     tmp = str(dst) + ".tmp_convert"
     shutil.copy(src, tmp)
@@ -517,115 +393,158 @@ def apply_to_docx(src, dst, repls, cmap, style="bracket"):
             if item.filename == "word/document.xml":
                 xml = data.decode("utf-8")
                 if style == "superscript":
-                    # Superscript runs are replaced directly in XML structure;
-                    # do NOT use repls (bare numbers would corrupt XML attributes)
                     xml = convert_superscript_xml(xml, cmap)
                 else:
-                    # Bracket style: safe to do string replacement ([N] is unique)
-                    xml = convert_xml(xml, repls, cmap)
+                    xml = convert_bracket_xml(xml, repls, cmap)
                 data = xml.encode("utf-8")
             zout.writestr(item, data)
-
     os.remove(tmp)
 
-    # Validate XML
+    # Validate
     with zipfile.ZipFile(dst) as z:
         raw = z.read("word/document.xml")
     try:
         ET.fromstring(raw)
     except ET.ParseError as e:
-        print(f"\n  ERROR: XML invalid after conversion: {e}")
+        print(f"  ERROR: XML invalid — {e}")
         return False
 
-    # Check for remaining bare citations
     plain = re.sub(r"<[^>]+>", "", raw.decode("utf-8"))
-    bare = [b for b in re.findall(r"\{[A-ZÀ-ž][^}#]{3,60}\}", plain) if "#" not in b]
+    bare  = [b for b in re.findall(r"\{[A-ZÀ-ž][^}#]{3,60}\}", plain) if "#" not in b]
     if bare:
-        print(f"\n  WARNING: {len(bare)} citations still lack record numbers:")
+        print(f"  WARNING: {len(bare)} citations still lack record numbers:")
         for b in set(bare):
             print(f"    {b}")
     else:
         print("  All citations have record numbers ✓")
-
     return True
 
 
-# ── 11. Main ─────────────────────────────────────────────────────────────────
+# ── 12. Write combined RIS file ──────────────────────────────────────────────
+
+def write_ris(ris_data, refs, ris_path):
+    """Write RIS entries in reference list order (1..N)."""
+    entries = []
+    for ref in sorted(refs, key=lambda r: r["num"]):
+        ris = ris_data.get(ref["num"])
+        if ris:
+            entries.append(ris.strip())
+    ris_path.write_text("\n\n".join(entries) + "\n", encoding="utf-8")
+    print(f"  RIS file → {ris_path}")
+
+
+# ── 13. Main ─────────────────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert numbered .docx citations to EndNote temp citations")
+    ap = argparse.ArgumentParser(
+        description="Convert numbered .docx citations to EndNote temp citations (v3, RIS-based)"
+    )
     ap.add_argument("docx", help="Input .docx with numbered citations")
     ap.add_argument("--output", help="Output .docx path")
-    ap.add_argument("--xml",    help="EndNote XML output path")
-    ap.add_argument("--email",  default="fakoredesodiq@gmail.com",
-                    help="Email for CrossRef polite pool")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="Show detected refs/patterns only, no conversion")
+    ap.add_argument("--ris",    help="Combined RIS output path")
+    ap.add_argument("--email",  default="fakoredesodiq@gmail.com")
+    ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     src  = Path(args.docx).expanduser().resolve()
     stem = src.stem
     dst  = Path(args.output).resolve() if args.output else src.parent / f"{stem}_converted.docx"
-    xmlp = Path(args.xml).resolve()    if args.xml    else src.parent / f"{stem}_endnote.xml"
+    risp = Path(args.ris).resolve()    if args.ris    else src.parent / f"{stem}.ris"
 
     print(f"\n{'='*60}")
-    print("  Citation Converter v2.0")
+    print("  Citation Converter v3  (RIS-based, no hallucination)")
     print(f"  Input : {src}")
     print(f"{'='*60}")
 
+    # Step 1
     print("\n[1/5] Extracting reference list...")
     refs = extract_references(src)
-    no_doi = [r["num"] for r in refs if not r["doi"]]
-    print(f"  {len(refs)} references found | {len(no_doi)} without DOI: {no_doi}")
+    print(f"  {len(refs)} references found")
 
-    print("\n[2/5] Detecting citation patterns...")
-    patterns, style = find_all_patterns(src)
+    # Step 2
+    print("\n[2/5] Loading DOI overrides...")
+    overrides = load_overrides(src)
+
+    # Step 3
+    print("\n[3/5] Detecting citation style and patterns...")
+    style    = detect_style(src)
+    patterns = find_all_patterns(src, style)
     combined = [p for p in patterns if "," in p]
-    print(f"  Style detected: {style}")
-    print(f"  {len(patterns)} unique patterns | {len(combined)} combined: {combined}")
+    print(f"  Style: {style} | {len(patterns)} patterns | {len(combined)} combined: {combined}")
 
     if args.dry_run:
-        print("\n-- Dry run: first 5 references --")
-        for r in refs[:5]:
-            print(f"  [{r['num']}] DOI={r['doi']}")
-            print(f"       {r['text'][:90]}...")
+        print("\n-- Dry run: DOI resolution preview --")
+        for ref in refs:
+            doi = get_doi(ref, overrides)
+            manual = "MANUAL-RIS" if get_manual_ris(ref, overrides) else ""
+            status = doi or manual or "MISSING"
+            print(f"  [{ref['num']:2d}] {status}")
         return 0
 
-    print("\n[3/5] Fetching CrossRef metadata...")
-    meta = fetch_all(refs, args.email)
-    print(f"  {len(meta)}/{len(refs)} fetched from CrossRef")
+    # Step 4: fetch RIS for every reference
+    print("\n[4/5] Fetching RIS from CrossRef...")
+    ris_data = {}
+    ok = missing = 0
 
-    print("\n[4/5] Building citation map...")
-    cmap = build_map(refs, meta)
+    for ref in refs:
+        num = ref["num"]
+
+        # Manual RIS (WHO books, reports)
+        manual = get_manual_ris(ref, overrides)
+        if manual:
+            ris_data[num] = manual
+            print(f"  [{num:2d}] manual RIS")
+            ok += 1
+            continue
+
+        doi = get_doi(ref, overrides)
+        if not doi:
+            print(f"  [{num:2d}] NO DOI — skipping (add to doi_overrides.json)")
+            missing += 1
+            continue
+
+        print(f"  [{num:2d}] {doi}")
+        ris = fetch_ris(doi, args.email)
+        if ris:
+            ris_data[num] = ris
+            ok += 1
+        else:
+            print(f"       RIS fetch failed — will use text fallback")
+            missing += 1
+        time.sleep(0.25)
+
+    print(f"  {ok} fetched | {missing} missing")
+    if missing:
+        print(f"  Add missing DOIs to {src.stem}.doi_overrides.json and re-run")
+
+    # Step 5: build map, convert, write
+    print("\n[5/5] Converting and writing outputs...")
+    cmap  = build_citation_map(refs, ris_data)
     repls = build_replacements(patterns, cmap, style)
-    print(f"  {len(repls)} replacement rules built")
 
-    print("\n[5/5] Generating outputs...")
+    # Backup first
+    bak = src.parent / f"{stem}.bak.docx"
+    if not bak.exists():
+        shutil.copy(src, bak)
+        print(f"  Backup → {bak.name}")
 
-    # EndNote XML
-    xml_content = generate_endnote_xml(refs, meta, cmap)
-    xmlp.write_text(xml_content, encoding="utf-8")
-    print(f"  EndNote XML  → {xmlp}")
-
-    # Converted docx
+    write_ris(ris_data, refs, risp)
     ok = apply_to_docx(src, dst, repls, cmap, style)
 
     if ok:
-        print(f"  Converted doc → {dst}")
+        print(f"  Converted doc → {dst.name}")
         print(f"\n{'='*60}")
         print("  Done!\n")
         print("  Next steps:")
-        print(f"  1. In EndNote: File → Import → File")
-        print(f"     File: {xmlp}")
-        print(f"     Import Option: EndNote XML")
-        print(f"     Use a FRESH dedicated library for this paper")
-        print(f"  2. Open {dst} in Word")
-        print(f"  3. Delete the old reference list at the bottom")
-        print(f"  4. EndNote ribbon → Update Citations and Bibliography")
+        print("  1. In EndNote: File → New  (fresh library for this paper)")
+        print(f"  2. File → Import → File → {risp.name}")
+        print("     Import Option: Reference Manager (RIS)")
+        print("  3. Open the converted .docx in Word")
+        print("  4. Delete the old reference list at the bottom")
+        print("  5. EndNote ribbon → Update Citations and Bibliography")
         print(f"{'='*60}\n")
         return 0
-    else:
-        return 1
+    return 1
 
 
 if __name__ == "__main__":
