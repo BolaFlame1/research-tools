@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-citation_convert v3 — Convert numbered citations to EndNote temp citations.
+citation_convert v4 — Convert numbered citations to EndNote temp citations.
 
 Uses authoritative RIS downloaded directly from CrossRef (not self-constructed
 XML), eliminating hallucination risk for author names, years, and journal data.
@@ -113,38 +113,118 @@ def get_manual_ris(ref, overrides):
     return entry.get("ris")
 
 
-# ── 4. Fetch RIS from CrossRef ───────────────────────────────────────────────
+# ── 4. Fetch RIS — CrossRef → doi.org → PubMed ──────────────────────────────
+
+_EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
+
+def _pubmed_search(query, email):
+    """Run a PubMed esearch and return the first PMID, or None."""
+    try:
+        r = requests.get(
+            f"{_EUTILS}/esearch.fcgi",
+            params={"db": "pubmed", "term": query, "retmode": "json",
+                    "retmax": 1, "email": email},
+            headers={"User-Agent": f"citation-convert/4.0 mailto:{email}"},
+            timeout=15,
+        )
+        ids = r.json().get("esearchresult", {}).get("idlist", [])
+        return ids[0] if ids else None
+    except Exception:
+        return None
+
+
+def _pubmed_fetch_ris(pmid, email):
+    """
+    Fetch RIS from PubMed for a known PMID via the efetch API.
+    PubMed returns Y1 (print date) — more accurate than CrossRef's epub PY.
+    """
+    try:
+        r = requests.get(
+            f"{_EUTILS}/efetch.fcgi",
+            params={"db": "pubmed", "id": pmid, "rettype": "ris",
+                    "retmode": "text", "email": email},
+            headers={"User-Agent": f"citation-convert/4.0 mailto:{email}"},
+            timeout=15,
+        )
+        if r.status_code == 200 and "TY  -" in r.text:
+            return r.text.strip()
+    except Exception:
+        pass
+    return None
+
 
 def fetch_ris(doi, email):
     """
-    Fetch authoritative RIS from CrossRef transform endpoint.
-    Falls back to doi.org content negotiation if CrossRef transform fails.
+    Fetch authoritative RIS for a DOI.
+    Order: CrossRef transform → doi.org → PubMed DOI search.
+    PubMed uses print dates, so it also fixes epub-vs-print year issues
+    for biomedical papers that CrossRef gets wrong.
     Returns RIS text string or None.
     """
-    headers = {"User-Agent": f"citation-convert/3.0 mailto:{email}"}
+    headers = {"User-Agent": f"citation-convert/4.0 mailto:{email}"}
 
-    # Primary: CrossRef transform (most reliable, works for all CrossRef DOIs)
-    url = f"https://api.crossref.org/works/{doi}/transform/application/x-research-info-systems"
+    # 1. CrossRef transform (broadest coverage)
     try:
-        r = requests.get(url, headers=headers, timeout=15)
+        r = requests.get(
+            f"https://api.crossref.org/works/{doi}/transform/application/x-research-info-systems",
+            headers=headers, timeout=15,
+        )
         if r.status_code == 200 and "TY  -" in r.text:
             return r.text.strip()
-    except Exception as e:
-        print(f"    CrossRef transform failed: {e}")
+    except Exception:
+        pass
 
-    # Fallback: doi.org content negotiation
+    # 2. doi.org content negotiation
     try:
         r = requests.get(
             f"https://doi.org/{doi}",
             headers={**headers, "Accept": "application/x-research-info-systems"},
-            timeout=15, allow_redirects=True
+            timeout=15, allow_redirects=True,
         )
         if r.status_code == 200 and "TY  -" in r.text:
             return r.text.strip()
-    except Exception as e:
-        print(f"    doi.org fallback failed: {e}")
+    except Exception:
+        pass
+
+    # 3. PubMed DOI search (biomedical papers, print-year accurate)
+    pmid = _pubmed_search(f"{doi}[DOI]", email)
+    if pmid:
+        ris = _pubmed_fetch_ris(pmid, email)
+        if ris:
+            print(f"    → found via PubMed PMID:{pmid}")
+            return ris
 
     return None
+
+
+def fetch_ris_no_doi(ref_text, email):
+    """
+    For references with no DOI: try PubMed bibliographic text search.
+    Uses first-author + year as primary query, title words as fallback.
+    Returns (ris_text, pmid) or (None, None).
+    """
+    # Query 1: first author + year (precise)
+    author_m = re.search(r"^([A-Z][a-záéíóúñü\-]+)", ref_text.strip())
+    year_m   = re.search(r"\b(19|20)\d{2}\b", ref_text)
+    if author_m and year_m:
+        query = f"{author_m.group(1)}[Author] AND {year_m.group(0)}[PDAT]"
+        pmid = _pubmed_search(query, email)
+        if pmid:
+            ris = _pubmed_fetch_ris(pmid, email)
+            if ris:
+                return ris, pmid
+
+    # Query 2: first 7 title words
+    words = ref_text.split()[:7]
+    query = " ".join(words) + "[Title]"
+    pmid = _pubmed_search(query, email)
+    if pmid:
+        ris = _pubmed_fetch_ris(pmid, email)
+        if ris:
+            return ris, pmid
+
+    return None, None
 
 
 # ── 5. Parse RIS entry ───────────────────────────────────────────────────────
@@ -452,7 +532,7 @@ def main():
     risp = Path(args.ris).resolve()    if args.ris    else src.parent / f"{stem}.ris"
 
     print(f"\n{'='*60}")
-    print("  Citation Converter v3  (RIS-based, no hallucination)")
+    print("  Citation Converter v4  (CrossRef + PubMed fallback)")
     print(f"  Input : {src}")
     print(f"{'='*60}")
 
@@ -482,14 +562,14 @@ def main():
         return 0
 
     # Step 4: fetch RIS for every reference
-    print("\n[4/5] Fetching RIS from CrossRef...")
+    print("\n[4/5] Fetching RIS (CrossRef → doi.org → PubMed)...")
     ris_data = {}
     ok = missing = 0
 
     for ref in refs:
         num = ref["num"]
 
-        # Manual RIS (WHO books, reports)
+        # Manual RIS (WHO books, reports — from doi_overrides.json)
         manual = get_manual_ris(ref, overrides)
         if manual:
             ris_data[num] = manual
@@ -498,24 +578,42 @@ def main():
             continue
 
         doi = get_doi(ref, overrides)
-        if not doi:
-            print(f"  [{num:2d}] NO DOI — skipping (add to doi_overrides.json)")
-            missing += 1
-            continue
 
-        print(f"  [{num:2d}] {doi}")
-        ris = fetch_ris(doi, args.email)
-        if ris:
-            ris_data[num] = ris
-            ok += 1
+        if doi:
+            print(f"  [{num:2d}] {doi}", end="", flush=True)
+            ris = fetch_ris(doi, args.email)
+            if ris:
+                ris_data[num] = ris
+                print()
+                ok += 1
+            else:
+                # CrossRef + doi.org + PubMed all failed — try PubMed text search
+                print(" — all DOI sources failed, trying PubMed text search...")
+                ris, pmid = fetch_ris_no_doi(ref["text"], args.email)
+                if ris:
+                    print(f"       → found via PubMed PMID:{pmid}")
+                    ris_data[num] = ris
+                    ok += 1
+                else:
+                    print(f"       → FAILED — add manual RIS to doi_overrides.json")
+                    missing += 1
         else:
-            print(f"       RIS fetch failed — will use text fallback")
-            missing += 1
+            # No DOI anywhere — try PubMed bibliographic search
+            print(f"  [{num:2d}] no DOI — PubMed text search...", end="", flush=True)
+            ris, pmid = fetch_ris_no_doi(ref["text"], args.email)
+            if ris:
+                print(f" found PMID:{pmid}")
+                ris_data[num] = ris
+                ok += 1
+            else:
+                print(f" not found — add to doi_overrides.json")
+                missing += 1
+
         time.sleep(0.25)
 
-    print(f"  {ok} fetched | {missing} missing")
+    print(f"  {ok} fetched | {missing} still missing")
     if missing:
-        print(f"  Add missing DOIs to {src.stem}.doi_overrides.json and re-run")
+        print(f"  For missing refs: add DOI or manual RIS to {src.stem}.doi_overrides.json")
 
     # Step 5: build map, convert, write
     print("\n[5/5] Converting and writing outputs...")
