@@ -200,12 +200,17 @@ grep -c "{doi}" {project_root}/references/cards/{slug}/source.md
 
 | Check | Threshold | Failure action |
 |-------|-----------|----------------|
-| Line count < 300 | — | `md_quality: abstract-only` → log → stop, request higher tier |
-| Methods not found | count = 0 | `md_quality: abstract-only` → log → stop |
-| Results not found | count = 0 | `md_quality: abstract-only` → log → stop |
-| References not found | count = 0 | `md_quality: partial` → warn, continue |
+| Line count < 80 | — | `md_quality: abstract-only` → log → stop, request higher tier |
+| Heading count (##) < 3 | — | `md_quality: abstract-only` → log → stop |
+| Methods + Results headings present | — | → `md_quality: full-text` |
+| ≥ 5 headings but no Methods/Results | — | → `md_quality: full-text-review` (review/seminar paper); continue |
+| 3–4 headings, no Methods/Results | — | → `md_quality: partial` → warn, continue |
+| Words run together (no spaces in long tokens) | — | `md_quality: garbled-conversion` → log → stop, request re-fetch |
+| References section not found | count = 0 | warn only, do not stop |
 | Author surname not in first 50 lines | — | `bibtex_integrity: AUTHOR_MISMATCH` → log → stop |
-| DOI not in source.md | count = 0 | `bibtex_integrity: DOI_MISMATCH` → log → stop |
+| DOI string in source.md | count = 0 | `bibtex_integrity: DOI_MISMATCH` → log → stop |
+
+**Note on review papers:** Review articles, seminar papers, and guidelines (Lancet Commission reports, AHA statements, STROBE guidelines) do not use Methods/Results headings. They pass as `full-text-review` when ≥ 5 section headings are present. Extraction rules are identical — all pointers must still be quote-locked to source.md line numbers.
 
 On any stop-failure:
 1. Update `meta.json` with the failure field
