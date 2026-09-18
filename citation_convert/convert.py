@@ -76,6 +76,19 @@ def extract_references(docx_path):
                          "doi": _extract_doi_from_text(body)})
 
     if not refs:
+        # Fallback: plain unnumbered paragraphs (Vancouver without [N] prefix).
+        # Stop at figure legends / table headers / footnote blocks.
+        stop_words = ("figure legends", "figures", "tables", "footnotes", "supplementary")
+        for i, line in enumerate(ref_text.splitlines(), 1):
+            body = line.strip()
+            if not body:
+                continue
+            if any(body.lower().startswith(w) for w in stop_words):
+                break
+            body = " ".join(body.split())
+            refs.append({"num": i, "text": body, "doi": _extract_doi_from_text(body)})
+
+    if not refs:
         raise ValueError("No numbered references found. Expected '[N] ...' or 'N. ...' format.")
     return refs
 
@@ -262,6 +275,9 @@ def detect_style(docx_path):
     plain = re.sub(r"<[^>]+>", "", xml)
     brackets = len(re.findall(r"\[\d+\]", plain))
     sups = len(re.findall(r'vertAlign w:val="superscript"', xml))
+    parens = len(re.findall(r'\(\d{1,3}(?:,\s*\d{1,3})*\)', plain))
+    if parens > brackets and parens > sups:
+        return "paren"
     return "bracket" if brackets >= sups else "superscript"
 
 
@@ -288,6 +304,18 @@ def find_all_patterns(docx_path, style):
         for m in re.finditer(r"\[(\d+)\]", plain):
             ctx = plain[m.end():m.end() + 3]
             if not re.match(r"\s+[A-Z]", ctx):
+                patterns.add(m.group(0))
+    elif style == "paren":
+        body_start = _find_body_start(xml)
+        ref_start  = xml.find(">References<")
+        body_xml   = xml[body_start:ref_start] if ref_start > 0 else xml[body_start:]
+        body_plain = re.sub(r"<[^>]+>", "", body_xml)
+        # Multi-number combos are unambiguously citations
+        patterns |= set(re.findall(r'\(\d{1,3}(?:,\s*\d{1,3})+\)', body_plain))
+        # Single-number citations
+        for m in re.finditer(r'\((\d{1,3})\)', body_plain):
+            n = int(m.group(1))
+            if 1 <= n <= 300:
                 patterns.add(m.group(0))
     else:
         body_start = _find_body_start(xml)
@@ -419,6 +447,13 @@ def convert_superscript_xml(xml, cmap):
     return prefix + "".join(result) + tail
 
 
+def convert_paren_xml(xml, repls, cmap):
+    # Exact string replacement, longest pattern first to avoid partial matches
+    for old, new in sorted(repls.items(), key=lambda x: -len(x[0])):
+        xml = xml.replace(old, new)
+    return xml
+
+
 def convert_bracket_xml(xml, repls, cmap):
     # Pass 1: simple string replacements (longest first, bracket-safe)
     for old, new in sorted(repls.items(), key=lambda x: -len(x[0])):
@@ -474,6 +509,8 @@ def apply_to_docx(src, dst, repls, cmap, style):
                 xml = data.decode("utf-8")
                 if style == "superscript":
                     xml = convert_superscript_xml(xml, cmap)
+                elif style == "paren":
+                    xml = convert_paren_xml(xml, repls, cmap)
                 else:
                     xml = convert_bracket_xml(xml, repls, cmap)
                 data = xml.encode("utf-8")
