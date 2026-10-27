@@ -167,7 +167,42 @@ def _pubmed_fetch_ris(pmid, email):
     return None
 
 
-def fetch_ris(doi, email):
+def _ris_compact(ris_text):
+    """Lowercased alphanumerics only, so formatting noise can't fake a mismatch."""
+    return re.sub(r"[^a-z0-9]", "", ris_text.lower())
+
+
+def _pubmed_fetch_ris_verified(doi, ref_text, email, min_shared=2):
+    """
+    Return PubMed RIS for `doi`, but only when the hit is provably the same paper.
+
+    CrossRef's RIS transform uses `issued` (= online-first date), so epub-ahead-of-
+    print articles come out with the wrong year. PubMed carries the print year.
+
+    Acceptance, strictest first:
+      1. PubMed's DOI exactly equals the requested DOI (no title check needed), or
+      2. title shares >= min_shared significant tokens with `ref_text` AND the
+         volume matches — or the DOI is absent from both sides.
+    Anything else is rejected rather than patched, so a wrong paper can never be
+    swapped in.
+    """
+    pmid = _pubmed_search(f"{doi}[DOI]", email)
+    if not pmid:
+        return None
+    ris = _pubmed_fetch_ris(pmid, email)
+    if not ris:
+        return None
+
+    pm_doi = re.search(r"^DO  - (.+)$", ris, re.MULTILINE)
+    if pm_doi and pm_doi.group(1).strip().lower() == doi.strip().lower():
+        return ris
+
+    if ref_text and not _title_matches_ref(ris, ref_text, min_shared=min_shared):
+        return None
+    return ris
+
+
+def fetch_ris(doi, email, ref_text=None):
     """
     Fetch authoritative RIS for a DOI.
     Order: CrossRef transform → doi.org → PubMed DOI search.
@@ -211,12 +246,110 @@ def fetch_ris(doi, email):
     return None
 
 
+_RIS_YEAR = re.compile(r"^(?:PY|Y1)  - (\d{4})", re.MULTILINE)
+
+
+def reconcile_print_year(ris_text, doi, ref_text, email):
+    """
+    If the manuscript cites a year that differs from the RIS year, try PubMed for
+    the print year before accepting the RIS. Only applies to biomedical records
+    PubMed indexes; returns the original RIS unless a verified PubMed record has
+    a year that actually matches the manuscript.
+
+    PubMed emits Y1 for the print date and often omits PY, so both are read here.
+    """
+    m_py = _RIS_YEAR.search(ris_text)
+    m_ref = re.search(r"\b(19|20)\d{2}\b", ref_text or "")
+    if not (m_py and m_ref):
+        return ris_text
+    if m_py.group(1) == m_ref.group(0):
+        return ris_text
+
+    alt = _pubmed_fetch_ris_verified(doi, ref_text, email)
+    if not alt:
+        return ris_text
+    m_alt = _RIS_YEAR.search(alt)
+    if m_alt and m_alt.group(1) == m_ref.group(0):
+        print(f"\n    → print year {m_alt.group(1)} from PubMed (CrossRef said {m_py.group(1)})", end="")
+        return alt
+    return ris_text
+
+
+# Corporate / institutional authors whose publications almost never have DOIs
+# and are easily confused with unrelated papers by PubMed text search.
+# When a DOI-less ref starts with one of these, skip PubMed entirely and
+# require a manual override.
+_CORPORATE_AUTHOR_PREFIXES = (
+    "world health organization", "who ", "united nations", "unicef",
+    "centers for disease control", "cdc ", "national institute",
+    "institute of medicine", "national academies", "european commission",
+    "world bank", "oecd ", "food and agriculture organization",
+    "international labour organization", "unaids",
+)
+
+
+_STOPWORDS = {
+    "a", "an", "and", "or", "the", "of", "in", "on", "at", "to", "for", "from",
+    "with", "by", "as", "is", "are", "was", "were", "be", "been", "being",
+    "that", "this", "these", "those", "it", "its", "their", "there", "here",
+    "but", "not", "no", "nor", "so", "than", "then", "if", "else", "when",
+    "where", "how", "why", "what", "which", "who", "whom", "whose", "about",
+    "above", "below", "between", "into", "onto", "upon", "over", "under",
+    "study", "studies", "report", "reports", "based", "using", "use", "used",
+    "analysis", "analyses", "results", "data", "method", "methods",
+    "systematic", "review", "reviews", "meta",
+}
+
+
+def _significant_tokens(text):
+    """Lowercase alphabetic tokens of length >=4 that aren't stopwords."""
+    return {w for w in re.findall(r"[a-zà-ÿ]{4,}", text.lower()) if w not in _STOPWORDS}
+
+
+def _title_matches_ref(ris_text, ref_text, min_shared=3):
+    """
+    Reject-the-hit guard. Returns True iff the RIS title shares at least
+    `min_shared` significant tokens with the manuscript reference text.
+    Catches cases where PubMed returns an unrelated paper (e.g. a drowning
+    report for a WHO dementia status report).
+    """
+    m = re.search(r"^T[I1]  - (.+)$", ris_text, re.MULTILINE)
+    if not m:
+        return False
+    title_tokens = _significant_tokens(m.group(1))
+    ref_tokens   = _significant_tokens(ref_text)
+    shared = title_tokens & ref_tokens
+    return len(shared) >= min_shared
+
+
+def _looks_corporate(ref_text):
+    """True if the ref text starts with a known institutional author."""
+    head = ref_text.strip().lower()[:60]
+    return any(head.startswith(p) for p in _CORPORATE_AUTHOR_PREFIXES)
+
+
 def fetch_ris_no_doi(ref_text, email):
     """
     For references with no DOI: try PubMed bibliographic text search.
     Uses first-author + year as primary query, title words as fallback.
+    Each candidate hit is verified by title-token overlap against the
+    manuscript reference text; unrelated hits are rejected.
     Returns (ris_text, pmid) or (None, None).
     """
+    # Short-circuit: corporate/institutional authors (WHO, UNICEF, CDC, …)
+    # publish books and reports that PubMed doesn't index. Any hit here is
+    # almost certainly wrong — refuse to guess and force a manual override.
+    if _looks_corporate(ref_text):
+        return None, None
+
+    def _accept(pmid):
+        ris = _pubmed_fetch_ris(pmid, email)
+        if not ris:
+            return None
+        if not _title_matches_ref(ris, ref_text):
+            return None
+        return ris
+
     # Query 1: first author + year (precise)
     author_m = re.search(r"^([A-Z][a-záéíóúñü\-]+)", ref_text.strip())
     year_m   = re.search(r"\b(19|20)\d{2}\b", ref_text)
@@ -224,7 +357,7 @@ def fetch_ris_no_doi(ref_text, email):
         query = f"{author_m.group(1)}[Author] AND {year_m.group(0)}[PDAT]"
         pmid = _pubmed_search(query, email)
         if pmid:
-            ris = _pubmed_fetch_ris(pmid, email)
+            ris = _accept(pmid)
             if ris:
                 return ris, pmid
 
@@ -233,7 +366,7 @@ def fetch_ris_no_doi(ref_text, email):
     query = " ".join(words) + "[Title]"
     pmid = _pubmed_search(query, email)
     if pmid:
-        ris = _pubmed_fetch_ris(pmid, email)
+        ris = _accept(pmid)
         if ris:
             return ris, pmid
 
@@ -602,6 +735,8 @@ def main():
     print("\n[4/5] Fetching RIS (CrossRef → doi.org → PubMed)...")
     ris_data = {}
     ok = missing = 0
+    text_search_hits = []   # refs resolved via PubMed text search — need manual eyeballing
+    missing_refs = []       # refs we could not resolve at all
 
     for ref in refs:
         num = ref["num"]
@@ -618,8 +753,9 @@ def main():
 
         if doi:
             print(f"  [{num:2d}] {doi}", end="", flush=True)
-            ris = fetch_ris(doi, args.email)
+            ris = fetch_ris(doi, args.email, ref["text"])
             if ris:
+                ris = reconcile_print_year(ris, doi, ref["text"], args.email)
                 ris_data[num] = ris
                 print()
                 ok += 1
@@ -628,29 +764,49 @@ def main():
                 print(" — all DOI sources failed, trying PubMed text search...")
                 ris, pmid = fetch_ris_no_doi(ref["text"], args.email)
                 if ris:
-                    print(f"       → found via PubMed PMID:{pmid}")
+                    print(f"       → found via PubMed PMID:{pmid}  ⚠ verify manually")
                     ris_data[num] = ris
+                    text_search_hits.append((num, pmid, ref["text"][:120]))
                     ok += 1
                 else:
                     print(f"       → FAILED — add manual RIS to doi_overrides.json")
                     missing += 1
+                    missing_refs.append((num, ref["text"][:120]))
         else:
             # No DOI anywhere — try PubMed bibliographic search
-            print(f"  [{num:2d}] no DOI — PubMed text search...", end="", flush=True)
-            ris, pmid = fetch_ris_no_doi(ref["text"], args.email)
-            if ris:
-                print(f" found PMID:{pmid}")
-                ris_data[num] = ris
-                ok += 1
-            else:
-                print(f" not found — add to doi_overrides.json")
+            if _looks_corporate(ref["text"]):
+                print(f"  [{num:2d}] no DOI — corporate author ({ref['text'].split('.')[0][:40]}) → "
+                      f"add manual RIS to doi_overrides.json")
                 missing += 1
+                missing_refs.append((num, ref["text"][:120]))
+            else:
+                print(f"  [{num:2d}] no DOI — PubMed text search...", end="", flush=True)
+                ris, pmid = fetch_ris_no_doi(ref["text"], args.email)
+                if ris:
+                    print(f" found PMID:{pmid}  ⚠ verify manually")
+                    ris_data[num] = ris
+                    text_search_hits.append((num, pmid, ref["text"][:120]))
+                    ok += 1
+                else:
+                    print(f" not found (or rejected by title overlap) — add to doi_overrides.json")
+                    missing += 1
+                    missing_refs.append((num, ref["text"][:120]))
 
         time.sleep(0.25)
 
     print(f"  {ok} fetched | {missing} still missing")
     if missing:
         print(f"  For missing refs: add DOI or manual RIS to {src.stem}.doi_overrides.json")
+    if text_search_hits:
+        print()
+        print(f"  ⚠ {len(text_search_hits)} ref(s) resolved by PubMed text search — VERIFY MANUALLY:")
+        for num, pmid, head in text_search_hits:
+            print(f"     [{num:2d}] PMID:{pmid}  — ref text: {head.strip()}…")
+    if missing_refs:
+        print()
+        print(f"  ✗ {len(missing_refs)} ref(s) unresolved — add RIS stub to {src.stem}.doi_overrides.json:")
+        for num, head in missing_refs:
+            print(f'     "{num}": {{"ris": "TY  - ...\\nER  - \\n"}}   — {head.strip()}…')
 
     # Step 5: build map, convert, write
     print("\n[5/5] Converting and writing outputs...")
