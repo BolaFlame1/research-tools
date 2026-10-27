@@ -172,7 +172,53 @@ def _ris_compact(ris_text):
     return re.sub(r"[^a-z0-9]", "", ris_text.lower())
 
 
-def _pubmed_fetch_ris_verified(doi, ref_text, email, min_shared=2):
+_PRINT_TAGS = ("Y1", "Y2", "DA")
+
+
+def ris_years(ris_text):
+    """{tag: year} for every date tag the record states."""
+    out = {}
+    for line in (ris_text or "").splitlines():
+        tag, val = line[:2], line[6:].strip() if len(line) > 6 else ""
+        if tag in _PRINT_TAGS or tag == "PY":
+            m = re.search(r"\b(19|20)\d{2}\b", val)
+            if m:
+                out.setdefault(tag, int(m.group(0)))
+    return out
+
+
+def print_year(ris_text):
+    """
+    The print/issue year of a RIS record, never the online-first year.
+
+    CrossRef's RIS transform writes `issued` (the online-first date) into PY and
+    may also emit Y1 — but for epub-ahead-of-print articles PY can be *later*
+    than Y1, so "earliest date tag" is not a safe rule either. The print year is
+    taken from the print-date tags first (Y1/Y2/DA), falling back to PY only when
+    the record carries no print tag at all. Returns None if no year is stated.
+    """
+    years = ris_years(ris_text)
+    for tag in _PRINT_TAGS:
+        if tag in years:
+            return years[tag]
+    return years.get("PY")
+
+
+def _ref_year(ref_text):
+    """The year the manuscript documents for a reference, or None.
+
+    Prefers the year immediately after the journal abbreviation
+    (`. J Nutr Health Aging. 2021;`), because the first year in a title may be a
+    study span ("1990–2017") or a guideline name ("PRISMA 2020").
+    """
+    m = re.findall(r"\.\s+[A-Z][A-Za-z.& ]{1,45}?\.\s+((?:19|20)\d{2})[;:]", ref_text or "")
+    if m:
+        return int(m[-1])
+    m = re.search(r";\s*((?:19|20)\d{2})[;.]", ref_text or "")
+    return int(m.group(1)) if m else None
+
+
+def _pubmed_fetch_ris_verified(doi, ref_text, email, min_shared=2, base_ris=None):
     """
     Return PubMed RIS for `doi`, but only when the hit is provably the same paper.
 
@@ -180,9 +226,10 @@ def _pubmed_fetch_ris_verified(doi, ref_text, email, min_shared=2):
     print articles come out with the wrong year. PubMed carries the print year.
 
     Acceptance, strictest first:
-      1. PubMed's DOI exactly equals the requested DOI (no title check needed), or
-      2. title shares >= min_shared significant tokens with `ref_text` AND the
-         volume matches — or the DOI is absent from both sides.
+      1. PubMed's DOI exactly equals the requested DOI, or
+      2. the title shares >= min_shared significant tokens with `ref_text` and
+         the volume agrees with `base_ris` (the CrossRef record we already
+         hold) — or one of the two states no volume.
     Anything else is rejected rather than patched, so a wrong paper can never be
     swapped in.
     """
@@ -199,6 +246,11 @@ def _pubmed_fetch_ris_verified(doi, ref_text, email, min_shared=2):
 
     if ref_text and not _title_matches_ref(ris, ref_text, min_shared=min_shared):
         return None
+    if base_ris:
+        va = re.search(r"^VL  - (.+)$", base_ris, re.MULTILINE)
+        vb = re.search(r"^VL  - (.+)$", ris, re.MULTILINE)
+        if va and vb and va.group(1).strip() != vb.group(1).strip():
+            return None
     return ris
 
 
@@ -246,32 +298,45 @@ def fetch_ris(doi, email, ref_text=None):
     return None
 
 
-_RIS_YEAR = re.compile(r"^(?:PY|Y1)  - (\d{4})", re.MULTILINE)
-
-
 def reconcile_print_year(ris_text, doi, ref_text, email):
     """
-    If the manuscript cites a year that differs from the RIS year, try PubMed for
-    the print year before accepting the RIS. Only applies to biomedical records
-    PubMed indexes; returns the original RIS unless a verified PubMed record has
-    a year that actually matches the manuscript.
+    Make the record's year the print year, and check it against the manuscript.
 
-    PubMed emits Y1 for the print date and often omits PY, so both are read here.
+    1. Collapse PY/Y1 to the print year locally (no network) — CrossRef supplies
+       Y1 whenever a print date exists, so this fixes epub years even for records
+       PubMed does not index.
+    2. If the result still disagrees with the manuscript, consult PubMed once.
+       A verified hit replaces the record outright; otherwise only its print
+       year is copied onto the CrossRef record, so volume/pages/DOI integrity is
+       preserved either way.
+    3. Print a warning the caller collects and the summary echoes, so a year the
+       record cannot confirm is never accepted silently.
     """
-    m_py = _RIS_YEAR.search(ris_text)
-    m_ref = re.search(r"\b(19|20)\d{2}\b", ref_text or "")
-    if not (m_py and m_ref):
-        return ris_text
-    if m_py.group(1) == m_ref.group(0):
+    local = print_year(ris_text)
+    own_py = re.search(r"^PY  - (\d{4})", ris_text or "", re.MULTILINE)
+    if local is not None and own_py and local != int(own_py.group(1)):
+        ris_text = re.sub(r"^PY  - \d{4}", f"PY  - {local}", ris_text, count=1, flags=re.MULTILINE)
+        print(f"    → print year {local} (PY said {own_py.group(1)})")
+
+    want = _ref_year(ref_text)
+    have = print_year(ris_text)
+    if want and have == want:
         return ris_text
 
-    alt = _pubmed_fetch_ris_verified(doi, ref_text, email)
-    if not alt:
-        return ris_text
-    m_alt = _RIS_YEAR.search(alt)
-    if m_alt and m_alt.group(1) == m_ref.group(0):
-        print(f"\n    → print year {m_alt.group(1)} from PubMed (CrossRef said {m_py.group(1)})", end="")
-        return alt
+    alt = _pubmed_fetch_ris_verified(doi, ref_text, email, base_ris=ris_text)
+    if alt:
+        pm_year = print_year(alt)
+        if pm_year == want and alt != ris_text:
+            print(f"    → print year {pm_year} from PubMed (record said {have})")
+            return alt
+        if pm_year and pm_year != have:
+            ris_text = re.sub(r"^(?:PY|Y1)  - \d{4}", f"PY  - {pm_year}", ris_text, count=1, flags=re.MULTILINE)
+            have = pm_year
+            if pm_year == want:
+                return ris_text
+
+    if want and have != want:
+        print(f"    ⚠ YEAR UNCONFIRMED — manuscript says {want}, record says {have}; verify manually")
     return ris_text
 
 
@@ -379,9 +444,13 @@ def parse_ris(ris_text):
     """
     Extract first author last name and publication year from a RIS entry.
     Returns (author_last, year_int).
-    """
-    author, year = "Unknown", 0
 
+    The year is the print year (see `print_year`), never PY alone: CrossRef
+    puts the online-first date in PY, so taking the first PY/Y1 line would put
+    the epub year into the temp citation and trigger an EndNote disambiguation
+    prompt at Update Citations and Bibliography.
+    """
+    author = "Unknown"
     for line in ris_text.splitlines():
         line = line.strip()
         tag = line[:2]
@@ -391,13 +460,7 @@ def parse_ris(ris_text):
             # RIS AU format: "Last, First" or "Last, F." or "Organization Name"
             author = val.split(",")[0].strip()
 
-        elif tag in ("PY", "DA", "Y1") and not year and val:
-            # PY  - 2022  or  PY  - 2022/01/01
-            m = re.search(r"\b(19|20)\d{2}\b", val)
-            if m:
-                year = int(m.group(0))
-
-    return author, year
+    return author, print_year(ris_text) or 0
 
 
 # ── 6. Auto-detect citation style ────────────────────────────────────────────
@@ -485,8 +548,7 @@ def build_citation_map(refs, ris_data):
             m = re.search(r"[A-Z][a-záéíóúñü\-]+", ref["text"])
             author = m.group(0) if m else "Unknown"
         if not year:
-            m = re.search(r"\b(19|20)\d{2}\b", ref["text"])
-            year = int(m.group(0)) if m else 0
+            year = _ref_year(ref["text"]) or 0
 
         cmap[num] = {
             "author":     author,
